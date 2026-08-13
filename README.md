@@ -28,6 +28,35 @@ Detailed write-up (shareable): see the accompanying Google Doc.
    dedups the delta via AUTO CDC SCD-1, fans out to hourly, and appends into the same
    physical table via a Delta sink. Run on a daily schedule; never full-refresh.
 
+## Prerequisites
+
+**Source tables** (in your own catalog/schema):
+
+- `point_of_delivery` — Delta table. Columns used: `point_of_delivery_ean`,
+  `profile_category_code`, `sja`, `sj_unit_of_measure`, `commodity_type`,
+  `allocation_method`, `effective_from_date`, `effective_to_date`, `__record_timestamp`.
+- `gas_profile_fraction` — Delta table. Columns used: `profile_category_code`,
+  `supply_start_date_time_utc`, `profile_fraction`, `supply_hour`, `supply_date`.
+
+**Change Data Feed MUST be enabled on `point_of_delivery`** — the incremental pipeline
+reads its change feed, and CDF only records changes committed *after* it is turned on, so
+enable it **before** the backfill so nothing is missed at the seam:
+
+```sql
+ALTER TABLE <your_catalog>.<source_schema>.point_of_delivery
+  SET TBLPROPERTIES (delta.enableChangeDataFeed = true);
+```
+
+(If you use the generator below, CDF is enabled automatically.)
+
+**Compute / tooling:**
+- `init_backfill.py` runs on **Databricks Connect serverless** — Python 3.12 +
+  `databricks-connect>=16.4` locally, authenticated to the workspace.
+- The incremental pipeline runs as a **serverless SDP (Lakeflow Declarative) pipeline**,
+  triggered (scheduled daily via a Workflow).
+- The target hourly table is created/owned by `init_backfill.py`; the pipeline appends to
+  it via a Delta sink, so no separate table setup is needed.
+
 ## (Optional) Generate synthetic source data
 
 You already have the real source tables, so this step is **optional** — but it's handy
@@ -64,7 +93,7 @@ python init_backfill.py \
 
 Config keys for the pipeline: `engie.source_schema`, `engie.target_table`,
 `engie.cdf_starting_version` (= V), `engie.max_explode_years` (default 10).
-Requires `delta.enableChangeDataFeed = true` on the source `point_of_delivery`.
+(Change Data Feed must be enabled on the source — see Prerequisites.)
 
 ## Measured (full data scale)
 
