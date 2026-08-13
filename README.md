@@ -28,6 +28,27 @@ Detailed write-up (shareable): see the accompanying Google Doc.
    dedups the delta via AUTO CDC SCD-1, fans out to hourly, and appends into the same
    physical table via a Delta sink. Run on a daily schedule; never full-refresh.
 
+## (Optional) Generate synthetic source data
+
+You already have the real source tables, so this step is **optional** — but it's handy
+for reproducing the behaviour, benchmarking at a chosen scale, or testing the pipeline in
+a scratch schema. `generate_engie_nl_data.py` creates the two source tables
+(`point_of_delivery` + `gas_profile_fraction`) with realistic distributions and Change
+Data Feed already enabled.
+
+```bash
+# needs Python 3.12 + databricks-connect>=16.4 (serverless)
+# --scale is a fraction of full size: 1.0 = ~12M PODs (full), 0.05 = ~600k (fast test)
+python generate_engie_nl_data.py \
+  --catalog <your_catalog> --schema <source_schema> \
+  --scale 1.0
+```
+
+Options: `--scale` (0<scale≤1, default 0.01), `--pod-only`, `--profiles-only`
+(regenerate just one table). `gas_profile_fraction` is always built at full size (it's
+small); `--scale` only affects the `point_of_delivery` row count. The generator also
+prints the projected downstream fan-out for the chosen scale.
+
 ## Run
 
 ```bash
