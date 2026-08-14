@@ -24,9 +24,12 @@ Detailed write-up (shareable): see the accompanying Google Doc.
    `(supply_year, supply_month)` — no clustering on write. It prints the pinned
    source Delta version `V`.
 2. **Increment (SDP pipeline, daily):** reads the source **Change Data Feed** from
-   version `V` (only PODs changed since the backfill — never the 12M history),
-   dedups the delta via AUTO CDC SCD-1, fans out to hourly, and appends into the same
-   physical table via a Delta sink. Run on a daily schedule; never full-refresh.
+   version `V` (only PODs changed since the backfill — never the 12M history), and for
+   the changed EANs re-expands their current record to hourly grain and runs a scoped
+   **retracting MERGE** into the same physical table via a Delta sink: it inserts new
+   hours, updates changed ones, and **deletes hours that are no longer valid** (a shrunk
+   range's dropped tail, or a deleted POD). Just two pipeline objects — a change-feed
+   append flow and a `foreach_batch_sink`. Run on a daily schedule; never full-refresh.
 
 ## Prerequisites
 
@@ -95,15 +98,66 @@ Config keys for the pipeline: `engie.source_schema`, `engie.target_table`,
 `engie.cdf_starting_version` (= V), `engie.max_explode_years` (default 10).
 (Change Data Feed must be enabled on the source — see Prerequisites.)
 
-## Measured (full data scale)
+## Why the increment is Python, not SQL
 
-- History: ~7B rows in ~8 min (3 years), 0 duplicate keys, offtake reconciles to sja.
-- Daily increment (1 new POD): **~53 s**, history untouched — vs ~62 min reading the
-  full source naively.
+The team's standard flows are SQL (`AUTO CDC INTO`). This one can't be, for one reason:
+**retraction**. When a POD's range shrinks (e.g. `valid_to` 9999 → 2026-09-30) or a POD
+is deleted, the now-invalid hourly rows must be **deleted**. SQL `AUTO CDC INTO` only does
+keyed upserts — the orphaned tail hours are simply absent from the new data, so an upsert
+never touches them and they linger. Deleting them needs a `MERGE ... WHEN NOT MATCHED BY
+SOURCE ... DELETE`, and a MERGE inside a stream requires `foreach_batch`, which is
+Python-only. (Two lesser reasons: writing into a table the pipeline doesn't own also needs
+a Python Delta sink; and the change-feed bootstrap read is cleanest in the Python API.)
+
+**So the real question is functional, not technical:** *must invalid hours be retracted
+incrementally?* If corrections are rare and a periodic partition rebuild is acceptable,
+the increment collapses to a standard SQL `AUTO CDC` flow and the Python exception
+disappears. Decide this with the data owner. If Python stays, it is deliberately small —
+two objects, one MERGE — so it can be wrapped as a reusable parameterised component rather
+than hand-written per pipeline.
+
+## Reload / new-environment runbook (start version)
+
+`engie.cdf_starting_version` is used **only on the pipeline's first run** to know where to
+begin reading the change feed; after that the pipeline's own checkpoint drives it and the
+version is never used again. Set it to **`V`** (the value `init_backfill.py` prints) — not
+`V+1`: `readChangeFeed` **fails at startup** if `startingVersion` is beyond the table's
+latest commit, and right after a backfill `V+1` doesn't exist yet. Starting at `V` (which
+always exists) is safe; commit `V` is re-read once but the keyed MERGE makes that
+idempotent (no duplicates).
+
+Because `V` differs per environment and an old version can eventually be vacuumed, treat a
+**full history reload** as a coordinated, infrequent operation:
+
+1. Re-run `init_backfill.py` (rebuilds history; prints the new `V`).
+2. Set `engie.cdf_starting_version = V` (the freshly printed value) on the pipeline.
+3. **Full-refresh** the pipeline once (resets the checkpoint so it re-bootstraps from the
+   new `V`). Note: full-refresh resets the checkpoint but does **not** clean the target
+   table — the backfill already wrote it, and the MERGE reconciles.
+
+Normal daily runs need none of this — only a reload does.
+
+## Validated
+
+**Faithful logic test (26/26 checks):** backfill, range-shrink (tail deleted), hard delete
+(all rows removed), re-open to open-ended, backdated front-shrink, superseding correction
+(latest `__record_timestamp` wins), gas→electricity migration (old gas hours retracted),
+multi-EAN batch, and no-op — all with zero duplicate keys.
+
+**Live SDP pipeline run (this exact code):** bootstrap-at-`V` starts cleanly; a run
+carrying a shrink + a hard delete produced the correct retraction (shrunk POD's tail gone,
+deleted POD fully removed, untouched POD intact, 0 duplicates); a subsequent no-change run
+read only from the checkpoint, didn't crash, and left the table byte-identical.
+
+**Performance (synthetic, full scale):** history ~7B rows in ~8 min (3 years), 0 duplicate
+keys, offtake reconciles to `sja`; a 1-POD increment ~53 s vs ~62 min reading the full
+source naively. **Measure MERGE performance on the real data and volume** — the right data
+layout to keep retraction fast needs tuning against the actual table, not this synthetic set.
 
 ## Open items
 
-- **Deletes / historical corrections** to already-materialized rows need a targeted
-  per-partition rebuild (append can't retract).
-- **Highest-value question:** do consumers need physical hourly rows, or would
-  aggregates / query-time expansion suffice? If so, most of the cost disappears.
+- **Performance of the retracting MERGE at real volume** — needs measurement in ENGIE's
+  environment; the target's partitioning/layout may want tuning once change patterns are known.
+- **Highest-value question:** do consumers need physical hourly rows, or would aggregates /
+  query-time expansion suffice? If so, most of the cost — and the retraction complexity —
+  disappears.

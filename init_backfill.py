@@ -13,13 +13,20 @@ pipeline never re-computes history.
 The seam is made exact with a PINNED Delta version:
   * We read the current version V of point_of_delivery and process `VERSION AS OF V`.
   * This script prints V. Configure the incremental pipeline with
-    engie.source_starting_version = V + 1, so the stream reads only commits AFTER
-    the snapshot this backfill used — no row processed twice, none missed.
+    engie.cdf_starting_version = V.
+  * Why V and NOT V+1: readChangeFeed with a startingVersion beyond the table's
+    latest commit FAILS at query start ("cannot time travel to version N") — it does
+    not wait. Right after a backfill, V+1 does not exist yet, so a freshly-deployed
+    pipeline would crash until the first source change. Starting at V (which always
+    exists) avoids that. The one commit at V gets re-read on the first run, but the
+    target write is an idempotent keyed MERGE, so those rows merge to identical keys —
+    no duplicates, no double counting. After the first checkpoint the stream moves
+    forward and never re-reads V.
 
 Usage:
   DATABRICKS_CONFIG_PROFILE=... python init_backfill.py \
-      --catalog <your_catalog> --schema engie_nl_optb \
-      --source-schema <your_catalog>.<source_schema> \
+      --catalog alp_serverless_internal_ws_catalog --schema engie_nl_optb \
+      --source-schema alp_serverless_internal_ws_catalog.engie_nl_data \
       --years 2014,2015 [--truncate]
 """
 from __future__ import annotations
@@ -126,7 +133,7 @@ def main() -> int:
 
     v = current_version(spark, pod_tbl)
     print(f"📌 Pinned source version V = {v}")
-    print(f"   -> configure the incremental pipeline with engie.source_starting_version = {v + 1}")
+    print(f"   -> configure the incremental pipeline with engie.cdf_starting_version = {v}")
 
     pod_snap = spark.read.option("versionAsOf", v).table(pod_tbl)
 
@@ -137,7 +144,7 @@ def main() -> int:
         print(f"  ✓ {y}: appended (year now has {n:,} rows in {tgt})")
 
     print(f"\nDone. Target = {tgt}")
-    print(f"Next: run the incremental pipeline with engie.source_starting_version={v + 1}")
+    print(f"Next: run the incremental pipeline with engie.cdf_starting_version={v}")
     return 0
 
 
